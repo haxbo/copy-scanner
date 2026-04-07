@@ -79,12 +79,24 @@ class Config:
 
     def __init__(self):
         s = json.loads(SETTINGS_PATH.read_text())
+
+        # Max shares per trade. Polymarket minimum order is usually 5 shares.
         self.max_shares = int(s["copy_max_shares"])
+
+        # Max open trades (pending + open) at any time.
         self.max_positions = int(s["copy_max_positions"])
+
+        # Take-profit percentage. None = no auto TP sell.
         tp = s.get("copy_tp_pct")
         self.tp_pct = float(tp) if tp is not None else None
+
+        # Seconds between each monitor scan cycle.
         self.poll_interval = int(s["copy_poll_interval"])
+
+        # Max allowed price slippage between source entry price and current
+        # midpoint. Relative for prices >= 0.10, absolute for lower prices.
         self.max_price_slip = float(s["copy_max_price_slip"])
+
         # Risk kill-switches — log if using defaults (keys missing from settings.json)
         _defaults = {
             "copy_max_daily_loss": 50,
@@ -95,9 +107,24 @@ class Config:
         for key, default in _defaults.items():
             if key not in s:
                 log.warning(f"Config '{key}' missing from settings.json, using default: {default}")
+
+        # Daily loss cap (USD). Blocks new buys when realised P&L for the
+        # current UTC day exceeds this. Unrealised losses are NOT counted —
+        # only closed/resolved trades.
         self.max_daily_loss = float(s.get("copy_max_daily_loss", 50))
+
+        # Max new trades per UTC day. Hard cap to prevent runaway activity
+        # if a source wallet goes wild or detection logic misfires.
         self.max_trades_per_day = int(s.get("copy_max_trades_per_day", 50))
+
+        # Max total open stake (USD) from any single source wallet.
+        # Prevents concentration risk if one watched wallet is compromised.
+        # Checked post-trade: current_exposure + proposed_stake > cap = skip.
         self.max_stake_per_wallet = float(s.get("copy_max_stake_per_wallet", 25))
+
+        # Max total open stake (USD) on any single market slug.
+        # Prevents correlated risk on the same event.
+        # Checked post-trade: current_exposure + proposed_stake > cap = skip.
         self.max_stake_per_slug = float(s.get("copy_max_stake_per_slug", 10))
 
 
