@@ -1,9 +1,5 @@
 -- =============================================================
--- Database schemas — dumped from live SQLite databases
--- =============================================================
-
--- =============================================================
--- copy_scanner.db
+-- copy_scanner.db — full schema
 -- =============================================================
 
 CREATE TABLE copy_wallets (
@@ -93,36 +89,3 @@ CREATE INDEX idx_cs_reason ON copy_skips(reason);
 CREATE UNIQUE INDEX idx_ct_unique_open_asset ON copy_trades(asset) WHERE status IN ('pending', 'open');
 
 
--- =============================================================
--- cross_platform_arb.db
--- =============================================================
-
-CREATE TABLE xarb_scans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scanned_at TEXT NOT NULL,
-    game TEXT NOT NULL,
-    sport TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    kalshi_price REAL,
-    kalshi_size REAL,
-    poly_price REAL,
-    poly_size REAL,
-    cross_sum REAL,
-    edge REAL,
-    strategy TEXT
-);
-
-CREATE TABLE xarb_alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    alerted_at TEXT NOT NULL,
-    game TEXT NOT NULL,
-    sport TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    kalshi_price REAL,
-    poly_price REAL,
-    cross_sum REAL,
-    edge REAL,
-    strategy TEXT,
-    max_size REAL,
-    est_profit REAL
-);
