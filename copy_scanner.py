@@ -307,9 +307,12 @@ def add_wallet(conn, wallet: str):
 def remove_wallet(conn, wallet: str):
     """Disable a wallet (keeps position history)."""
     wallet = wallet.lower().strip()
-    conn.execute("UPDATE copy_wallets SET enabled=0 WHERE wallet=?", (wallet,))
+    cursor = conn.execute("UPDATE copy_wallets SET enabled=0 WHERE wallet=?", (wallet,))
     conn.commit()
-    print(f"  Disabled: {wallet[:10]}...")
+    if cursor.rowcount:
+        print(f"  Disabled: {wallet[:10]}...")
+    else:
+        print(f"  Wallet not found: {wallet[:10]}...")
 
 
 def list_wallets(conn):
@@ -460,6 +463,8 @@ def sync_all(conn, wallet_filter: str = None):
 # ── Stale pending cleanup ──────────────────────────────────────────────────
 
 PENDING_STALE_SECONDS = 60
+MAX_CONSECUTIVE_ORDER_FAILURES = 3
+_consecutive_order_failures = 0
 
 
 def _cleanup_stale_pending(conn):
@@ -492,15 +497,20 @@ def _cleanup_stale_pending(conn):
 
 def utc_now_str():
     """Canonical UTC timestamp string for DB storage."""
-    return utc_now_str()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_utc_timestamp(s):
-    """Parse a stored UTC timestamp string back to aware datetime."""
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    """Parse a stored UTC timestamp string back to aware datetime.
+    Primary format: %Y-%m-%d %H:%M:%S (what utc_now_str produces).
+    Fallback: fromisoformat for any older rows in different formats."""
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
 
 def _today_utc_str():
@@ -745,6 +755,16 @@ def copy_position(conn, pos: dict, wallet_name: str,
     if not asset:
         return False
 
+    # ── Safety: order-failure circuit breaker ──
+    global _consecutive_order_failures
+    if _consecutive_order_failures >= MAX_CONSECUTIVE_ORDER_FAILURES:
+        log.warning(f"Circuit breaker: {_consecutive_order_failures} consecutive order failures, "
+                    f"trading paused | {title[:45]}")
+        _log_skip(conn, pos, wallet_name, "circuit_breaker",
+                  f"consecutive_failures={_consecutive_order_failures}")
+        conn.commit()
+        return False
+
     # ── Safety: daily loss kill-switch ──
     loss_hit, daily_pnl = _daily_loss_check(conn, cfg)
     if loss_hit:
@@ -923,6 +943,7 @@ def copy_position(conn, pos: dict, wallet_name: str,
     if result.get("ok"):
         order_id = result.get("order_id", "")
         log.info(f"Copied: order={order_id[:20]}...")
+        _consecutive_order_failures = 0  # reset on success
         # Promote reservation to 'open'
         conn.execute("""UPDATE copy_trades SET
             order_id=?, status='open' WHERE id=?""",
@@ -931,7 +952,8 @@ def copy_position(conn, pos: dict, wallet_name: str,
         return True
     else:
         err = result.get("error", "unknown")
-        log.warning(f"Order failed: {err}")
+        _consecutive_order_failures += 1
+        log.warning(f"Order failed ({_consecutive_order_failures}/{MAX_CONSECUTIVE_ORDER_FAILURES}): {err}")
         # Delete the reservation — order never went through
         conn.execute("DELETE FROM copy_trades WHERE id=?", (trade_id,))
         _log_skip(conn, pos, wallet_name, "order_failed", str(err))
@@ -1173,7 +1195,7 @@ def _check_api_health():
         data = r.json()
         if not isinstance(data, list):
             return False, f"unexpected response type: {type(data).__name__}"
-        return True, f"OK ({r.status_code}, {len(data)} events)"
+        return True, f"healthy ({r.status_code}, {len(data)} events)"
     except requests.RequestException as e:
         return False, str(e)
     except (ValueError, TypeError) as e:
