@@ -24,6 +24,58 @@ const SETTINGS_GROUPS = {
     'Schedule': ['scan_start_hour', 'scan_end_hour', 'monitor_interval', 'dashboard_refresh'],
 };
 
+const COPY_PRESETS = {
+    testing: {
+        label: 'Testing',
+        desc: '~$2.50/trade, tight caps',
+        values: {
+            copy_max_shares: 5,
+            copy_max_positions: 20,
+            copy_max_trades_per_day: 10,
+            copy_max_daily_loss: 20,
+            copy_max_stake_per_wallet: 15,
+            copy_max_stake_per_slug: 10,
+        },
+    },
+    conservative: {
+        label: 'Conservative',
+        desc: '~$2.50/trade, wider caps',
+        values: {
+            copy_max_shares: 5,
+            copy_max_positions: 50,
+            copy_max_trades_per_day: 30,
+            copy_max_daily_loss: 50,
+            copy_max_stake_per_wallet: 30,
+            copy_max_stake_per_slug: 15,
+        },
+    },
+    aggressive: {
+        label: 'Aggressive',
+        desc: '100 trades/day, $100 loss cap',
+        values: {
+            copy_max_shares: 5,
+            copy_max_positions: 100,
+            copy_max_trades_per_day: 100,
+            copy_max_daily_loss: 100,
+            copy_max_stake_per_wallet: 50,
+            copy_max_stake_per_slug: 25,
+        },
+    },
+};
+
+const SETTING_DESCRIPTIONS = {
+    copy_enabled: 'Enable/disable the copy scanner',
+    copy_max_shares: 'Max shares per trade (min order size on Polymarket is usually 5)',
+    copy_max_positions: 'Max open trades at any time',
+    copy_tp_pct: 'Take-profit % (null = no auto TP)',
+    copy_poll_interval: 'Seconds between each scan cycle',
+    copy_max_price_slip: 'Max price slippage allowed vs source entry price',
+    copy_max_daily_loss: 'Stop trading if realised losses today exceed this USD amount',
+    copy_max_trades_per_day: 'Max new trades per UTC day',
+    copy_max_stake_per_wallet: 'Max total open stake from any single source wallet (USD)',
+    copy_max_stake_per_slug: 'Max total open stake on any single market/slug (USD)',
+};
+
 let originalSettings = {};
 
 async function renderSettingsTab(area) {
@@ -52,6 +104,31 @@ async function renderSettingsTab(area) {
 
             const body = document.createElement('div');
             body.className = 'settings-group-body';
+
+            // Add preset buttons for Copy Trading group
+            if (groupName === 'Copy Trading') {
+                const presetBar = document.createElement('div');
+                presetBar.className = 'filter-bar';
+                presetBar.style.padding = '12px 0 8px';
+
+                const presetLabel = document.createElement('span');
+                presetLabel.className = 'setting-label';
+                presetLabel.style.flex = '0';
+                presetLabel.style.whiteSpace = 'nowrap';
+                presetLabel.style.marginRight = '8px';
+                presetLabel.textContent = 'Presets:';
+                presetBar.appendChild(presetLabel);
+
+                for (const [id, preset] of Object.entries(COPY_PRESETS)) {
+                    const btn = document.createElement('button');
+                    btn.className = 'filter-btn';
+                    btn.textContent = preset.label;
+                    btn.title = preset.desc;
+                    btn.onclick = () => applyPreset(preset.values);
+                    presetBar.appendChild(btn);
+                }
+                body.appendChild(presetBar);
+            }
 
             for (const key of keys) {
                 if (!(key in settings)) continue;
@@ -107,6 +184,12 @@ function renderSettingField(key, value) {
     const label = document.createElement('label');
     label.className = 'setting-label';
     label.textContent = key;
+    if (SETTING_DESCRIPTIONS[key]) {
+        const hint = document.createElement('span');
+        hint.className = 'setting-hint';
+        hint.textContent = SETTING_DESCRIPTIONS[key];
+        label.appendChild(hint);
+    }
     row.appendChild(label);
 
     const inputWrap = document.createElement('div');
@@ -164,6 +247,22 @@ function renderSettingField(key, value) {
 
     row.appendChild(inputWrap);
     return row;
+}
+
+function applyPreset(values) {
+    for (const [key, val] of Object.entries(values)) {
+        const el = document.querySelector(`[data-key="${key}"]`);
+        if (!el) continue;
+        if (el.dataset.type === 'number') {
+            el.value = val;
+            el.style.borderColor = 'var(--warning)';
+        } else if (el.dataset.type === 'boolean') {
+            el.dataset.value = val;
+            el.textContent = val ? 'ON' : 'OFF';
+            el.className = 'toggle-switch' + (val ? ' on' : '');
+        }
+    }
+    showToast('Preset applied — review and Save');
 }
 
 async function saveSettings(form) {

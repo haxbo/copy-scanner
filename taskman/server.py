@@ -578,6 +578,38 @@ def _stop_task(name):
         return {"ok": False, "error": str(e)}
 
 
+TOGGLEABLE = {
+    ("copy_scanner", "copy_wallets"): ["enabled"],
+}
+
+
+def _toggle_bool(db_name, table, row_id, column):
+    """Toggle a boolean column on a whitelisted table."""
+    key = (db_name, table)
+    if key not in TOGGLEABLE or column not in TOGGLEABLE[key]:
+        return {"ok": False, "error": f"Cannot toggle {db_name}.{table}.{column}"}
+
+    info = ALLOWED_TABLES.get(db_name)
+    if not info:
+        return {"ok": False, "error": f"Unknown database: {db_name}"}
+
+    db_path = PROJECT_DIR / info["db"]
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute(f"SELECT {column} FROM {table} WHERE id=?", (row_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "error": "Row not found"}
+        new_val = 0 if row[0] else 1
+        conn.execute(f"UPDATE {table} SET {column}=? WHERE id=?", (new_val, row_id))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "value": new_val}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 class TaskHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(TASKMAN_DIR), **kwargs)
@@ -633,6 +665,14 @@ class TaskHandler(SimpleHTTPRequestHandler):
                 self._json_response(_stop_utility(name))
             else:
                 self._json_response(_stop_task(name))
+        elif path.startswith("/api/db/toggle/"):
+            # /api/db/toggle/{db}/{table}/{id}/{column}
+            parts = path.split("/api/db/toggle/")[1].split("/")
+            if len(parts) == 4:
+                self._json_response(_toggle_bool(parts[0], parts[1],
+                                                  int(parts[2]), parts[3]))
+            else:
+                self._json_response({"ok": False, "error": "Bad toggle path"})
         elif path == "/api/settings":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
