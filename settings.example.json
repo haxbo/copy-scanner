@@ -75,6 +75,7 @@
   "copy_max_trades_per_day": 50,
   "copy_max_stake_per_wallet": 25,
   "copy_max_stake_per_slug": 10,
+  "copy_max_total_exposure_usd": 100,
   "xarb_enabled": true,
   "xarb_poll_interval": 60,
   "xarb_min_edge": 0.03

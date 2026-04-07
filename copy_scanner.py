@@ -18,6 +18,12 @@ Usage:
     python copy_scanner.py monitor                 # poll & copy (all enabled wallets)
     python copy_scanner.py monitor --dry-run       # show only, don't trade
     python copy_scanner.py status                  # show wallet positions + our trades
+    python copy_scanner.py health                  # operational health snapshot
+    python copy_scanner.py trades                  # show open/pending/closed trades
+    python copy_scanner.py config                  # show config + runtime state
+    python copy_scanner.py pause                   # pause trading (monitoring continues)
+    python copy_scanner.py resume                  # resume trading + reset circuit breaker
+    python copy_scanner.py cleanup                 # clean stale state + reset circuit breaker
 """
 
 import argparse
@@ -75,6 +81,7 @@ class Config:
         "poll_interval", "max_price_slip",
         "max_daily_loss", "max_trades_per_day",
         "max_stake_per_wallet", "max_stake_per_slug",
+        "max_total_exposure",
     )
 
     def __init__(self):
@@ -103,6 +110,7 @@ class Config:
             "copy_max_trades_per_day": 50,
             "copy_max_stake_per_wallet": 25,
             "copy_max_stake_per_slug": 10,
+            "copy_max_total_exposure_usd": 100,
         }
         for key, default in _defaults.items():
             if key not in s:
@@ -127,10 +135,15 @@ class Config:
         # Checked post-trade: current_exposure + proposed_stake > cap = skip.
         self.max_stake_per_slug = float(s.get("copy_max_stake_per_slug", 10))
 
+        # Global exposure cap (USD). Total open stake across ALL trades.
+        # Prevents runaway capital deployment regardless of per-wallet/slug limits.
+        # Checked post-trade: total_exposure + proposed_stake > cap = skip.
+        self.max_total_exposure = float(s.get("copy_max_total_exposure_usd", 100))
+
 
 # ── Database ────────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 2  # bump when schema changes
+SCHEMA_VERSION = 3  # bump when schema changes
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS copy_wallets (
@@ -208,6 +221,31 @@ CREATE TABLE IF NOT EXISTS copy_skips (
 CREATE TABLE IF NOT EXISTS copy_schema_version (
     version INTEGER NOT NULL
 );
+
+-- Runtime state: circuit breaker, pause flag, etc. Persists across restarts.
+CREATE TABLE IF NOT EXISTS copy_runtime_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TEXT
+);
+
+-- Order audit: every buy attempt recorded for debugging & post-mortems.
+CREATE TABLE IF NOT EXISTS copy_order_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER,
+    asset TEXT,
+    slug TEXT,
+    source_wallet TEXT,
+    source_pseudonym TEXT,
+    attempt_time TEXT,
+    requested_price REAL,
+    requested_stake REAL,
+    requested_size REAL,
+    result_status TEXT,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    order_id TEXT
+);
 """
 
 _INDEX_SQL = """
@@ -225,6 +263,10 @@ CREATE INDEX IF NOT EXISTS idx_cs_reason
     ON copy_skips(reason);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ct_unique_open_asset
     ON copy_trades(asset) WHERE status IN ('pending', 'open');
+CREATE INDEX IF NOT EXISTS idx_coa_asset
+    ON copy_order_attempts(asset);
+CREATE INDEX IF NOT EXISTS idx_coa_attempt_time
+    ON copy_order_attempts(attempt_time);
 """
 
 
@@ -287,6 +329,11 @@ def _migrate(conn, from_ver: int, to_ver: int):
         conn.executescript(_INDEX_SQL)
         _safe_add_column(conn, "copy_positions", "copied", "INTEGER DEFAULT 0")
 
+    if from_ver < 3:
+        # v3: runtime state table + order audit table
+        conn.executescript(_SCHEMA_SQL)
+        conn.executescript(_INDEX_SQL)
+
     conn.execute("UPDATE copy_schema_version SET version=?", (to_ver,))
     conn.commit()
     log.info(f"Migrated schema from v{from_ver} to v{to_ver}")
@@ -299,6 +346,36 @@ def _db_fetchall(conn, sql, args=()):
 def _db_fetchone(conn, sql, args=()):
     row = conn.execute(sql, args).fetchone()
     return dict(row) if row else None
+
+
+# ── Runtime state helpers ─────────────────────────────────────────────────
+
+def _get_runtime_state(conn, key: str, default: str = "") -> str:
+    """Read a runtime state value from DB."""
+    row = _db_fetchone(conn, "SELECT value FROM copy_runtime_state WHERE key=?", (key,))
+    return row["value"] if row else default
+
+
+def _set_runtime_state(conn, key: str, value: str):
+    """Upsert a runtime state value."""
+    now = utc_now_str()
+    conn.execute(
+        "INSERT INTO copy_runtime_state (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, str(value), now))
+    conn.commit()
+
+
+def _log_order_attempt(conn, trade_id, asset, slug, source_wallet, source_pseudonym,
+                       price, stake, size, result_status, error_message="", order_id=""):
+    """Record every order attempt for audit trail."""
+    conn.execute("""INSERT INTO copy_order_attempts
+        (trade_id, asset, slug, source_wallet, source_pseudonym,
+         attempt_time, requested_price, requested_stake, requested_size,
+         result_status, error_message, order_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (trade_id, asset, slug, source_wallet, source_pseudonym,
+         utc_now_str(), price, stake, size, result_status, error_message, order_id))
 
 
 # ── Wallet management ─────────────────────────────────────────────────────
@@ -361,8 +438,8 @@ def list_wallets(conn):
 # ── Polymarket: fetch & store positions ───────────────────────────────────
 
 def _fetch_positions(wallet: str) -> list:
-    """Fetch all positions from Polymarket Data API."""
-    try:
+    """Fetch all positions from Polymarket Data API with retry."""
+    def _do_fetch():
         r = requests.get(f"{DATA_API}/positions", params={
             "user": wallet, "sizeThreshold": 0,
         }, timeout=15)
@@ -370,10 +447,13 @@ def _fetch_positions(wallet: str) -> list:
             log.warning(f"[DataAPI] Error: {r.status_code}")
             return []
         data = r.json()
-        return data if isinstance(data, list) else []
-    except requests.RequestException as e:
-        log.warning(f"[DataAPI] Fetch error: {e}")
-        return []
+        if not isinstance(data, list):
+            log.warning(f"[DataAPI] Unexpected response type: {type(data).__name__}")
+            return []
+        return data
+
+    result = _retry_request(_do_fetch, max_retries=2, backoff=1.0, label="fetch_positions")
+    return result if result is not None else []
 
 
 def sync_wallet(conn, wallet_id: int, wallet: str, positions=None) -> dict:
@@ -391,13 +471,25 @@ def sync_wallet(conn, wallet_id: int, wallet: str, positions=None) -> dict:
 
     for p in positions:
         asset = p.get("asset", "")
-        if not asset:
+        if not asset or not isinstance(asset, str):
             continue
-        size = float(p.get("size", 0))
+        # Validate numeric fields before using
+        try:
+            size = float(p.get("size", 0))
+        except (ValueError, TypeError):
+            log.warning(f"[Sync] Invalid size for asset {asset[:20]}..., skipping")
+            continue
         if size <= 0:
             continue
 
         live_assets.add(asset)
+
+        # Validate critical numeric fields
+        def _safe_float(val, default=0.0):
+            try:
+                return float(val) if val is not None else default
+            except (ValueError, TypeError):
+                return default
 
         existing = _db_fetchone(conn,
             "SELECT id FROM copy_positions WHERE wallet_id=? AND asset=?",
@@ -414,10 +506,10 @@ def sync_wallet(conn, wallet_id: int, wallet: str, positions=None) -> dict:
                     last_seen_at=?, closed_at=NULL
                 WHERE id=?
             """, (
-                size, float(p.get("avgPrice", 0)),
-                float(p.get("initialValue", 0)), float(p.get("currentValue", 0)),
-                float(p.get("cashPnl", 0)), float(p.get("percentPnl", 0)),
-                float(p.get("totalBought", 0)), float(p.get("curPrice", 0)),
+                size, _safe_float(p.get("avgPrice")),
+                _safe_float(p.get("initialValue")), _safe_float(p.get("currentValue")),
+                _safe_float(p.get("cashPnl")), _safe_float(p.get("percentPnl")),
+                _safe_float(p.get("totalBought")), _safe_float(p.get("curPrice")),
                 1 if p.get("redeemable") else 0,
                 p.get("title", ""), p.get("slug", ""),
                 p.get("icon", ""), p.get("eventSlug", ""),
@@ -439,10 +531,10 @@ def sync_wallet(conn, wallet_id: int, wallet: str, positions=None) -> dict:
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 wallet_id, asset, p.get("conditionId", ""),
-                size, float(p.get("avgPrice", 0)),
-                float(p.get("initialValue", 0)), float(p.get("currentValue", 0)),
-                float(p.get("cashPnl", 0)), float(p.get("percentPnl", 0)),
-                float(p.get("totalBought", 0)), float(p.get("curPrice", 0)),
+                size, _safe_float(p.get("avgPrice")),
+                _safe_float(p.get("initialValue")), _safe_float(p.get("currentValue")),
+                _safe_float(p.get("cashPnl")), _safe_float(p.get("percentPnl")),
+                _safe_float(p.get("totalBought")), _safe_float(p.get("curPrice")),
                 1 if p.get("redeemable") else 0,
                 p.get("title", ""), p.get("slug", ""),
                 p.get("icon", ""), p.get("eventSlug", ""),
@@ -491,7 +583,7 @@ def sync_all(conn, wallet_filter: str = None):
 
 PENDING_STALE_SECONDS = 60
 MAX_CONSECUTIVE_ORDER_FAILURES = 3
-_consecutive_order_failures = 0
+CIRCUIT_BREAKER_DECAY_SECONDS = 3600  # reset after 1 hour of no failures
 
 
 def _cleanup_stale_pending(conn):
@@ -544,6 +636,22 @@ def _today_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _retry_request(fn, max_retries=2, backoff=1.0, label="request"):
+    """Retry a read-only callable on RequestException. Returns fn() result or last exception's default."""
+    last_err = None
+    for attempt in range(1 + max_retries):
+        try:
+            return fn()
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < max_retries:
+                log.warning(f"[Retry] {label} attempt {attempt+1} failed: {e} — retrying in {backoff}s")
+                time.sleep(backoff)
+            else:
+                log.warning(f"[Retry] {label} failed after {1+max_retries} attempts: {e}")
+    return None  # caller must handle None
+
+
 def _daily_loss_check(conn, cfg):
     """Return True if daily loss limit is exceeded (block new buys).
 
@@ -589,6 +697,22 @@ def _slug_open_stake(conn, slug):
     return row["total"] if row else 0
 
 
+def _total_open_stake(conn):
+    """Sum of all open stake across all trades."""
+    row = _db_fetchone(conn,
+        "SELECT COALESCE(SUM(our_stake), 0) as total FROM copy_trades "
+        "WHERE status IN ('pending','open')")
+    return row["total"] if row else 0
+
+
+def _unrealised_pnl(conn):
+    """Sum of unrealised P&L for all open trades."""
+    row = _db_fetchone(conn,
+        "SELECT COALESCE(SUM(pnl_usd), 0) as total FROM copy_trades "
+        "WHERE status='open'")
+    return row["total"] if row else 0
+
+
 # ── Order sizing ──────────────────────────────────────────────────────────
 
 def determine_order_size(buy_price, min_shares, cfg):
@@ -613,7 +737,7 @@ def determine_order_size(buy_price, min_shares, cfg):
 
 def _check_market(slug: str, asset: str):
     """
-    Validate a specific market+token on Polymarket.
+    Validate a specific market+token on Polymarket with retry.
 
     Checks the Gamma API for the event, then finds the specific market
     whose token matches our asset. This prevents trading on a closed
@@ -623,17 +747,31 @@ def _check_market(slug: str, asset: str):
     """
     if not slug:
         return {"accepting": False, "order_min_size": 5, "closed": True}
-    try:
+
+    def _do_check():
         r = requests.get(f"{POLY_GAMMA}/events", params={"slug": slug}, timeout=10)
         data = r.json()
         if not isinstance(data, list) or not data:
             return {"accepting": False, "order_min_size": 5, "closed": True}
         ev = data[0]
+
+        # Validate event payload shape
+        if not isinstance(ev, dict):
+            log.warning(f"[Gamma] Unexpected event type: {type(ev).__name__}")
+            return {"accepting": False, "order_min_size": 5, "closed": True}
+
         if ev.get("closed"):
             return {"accepting": False, "order_min_size": 5, "closed": True}
 
+        markets = ev.get("markets")
+        if not isinstance(markets, list):
+            log.warning(f"[Gamma] Missing or invalid 'markets' in event {slug}")
+            return {"accepting": False, "order_min_size": 5, "closed": True}
+
         # Find the specific market that contains our asset token
-        for mkt in ev.get("markets", []):
+        for mkt in markets:
+            if not isinstance(mkt, dict):
+                continue
             tokens_raw = mkt.get("clobTokenIds", "")
             # Parse to list — clobTokenIds can be JSON string or already a list
             if isinstance(tokens_raw, str):
@@ -662,9 +800,8 @@ def _check_market(slug: str, asset: str):
         log.warning(f"Asset {asset[:20]}... not found in event {slug}")
         return {"accepting": False, "order_min_size": 5, "closed": True}
 
-    except requests.RequestException as e:
-        log.warning(f"[Gamma] Market check error for {slug}: {e}")
-        return None  # fail closed
+    result = _retry_request(_do_check, max_retries=2, backoff=1.0, label=f"check_market({slug})")
+    return result  # None on total failure = fail closed
 
 
 def _log_skip(conn, pos: dict, wallet_name: str, reason: str, details: str = ""):
@@ -782,13 +919,32 @@ def copy_position(conn, pos: dict, wallet_name: str,
     if not asset:
         return False
 
-    # ── Safety: order-failure circuit breaker ──
-    global _consecutive_order_failures
-    if _consecutive_order_failures >= MAX_CONSECUTIVE_ORDER_FAILURES:
-        log.warning(f"Circuit breaker: {_consecutive_order_failures} consecutive order failures, "
+    # ── Safety: persistent trading pause flag ──
+    if _get_runtime_state(conn, "trading_paused", "0") == "1":
+        log.info(f"Skip: trading paused | {title[:45]}")
+        _log_skip(conn, pos, wallet_name, "trading_paused", "operator pause active")
+        conn.commit()
+        return False
+
+    # ── Safety: order-failure circuit breaker (persisted in DB) ──
+    cb_failures = int(_get_runtime_state(conn, "consecutive_order_failures", "0"))
+    # Decay: reset if last failure was > CIRCUIT_BREAKER_DECAY_SECONDS ago
+    if cb_failures > 0:
+        last_fail = _get_runtime_state(conn, "last_failure_at", "")
+        if last_fail:
+            try:
+                elapsed = (datetime.now(timezone.utc) - parse_utc_timestamp(last_fail)).total_seconds()
+                if elapsed > CIRCUIT_BREAKER_DECAY_SECONDS:
+                    cb_failures = 0
+                    _set_runtime_state(conn, "consecutive_order_failures", "0")
+                    log.info("Circuit breaker reset (cooling-off period elapsed)")
+            except (ValueError, TypeError):
+                pass
+    if cb_failures >= MAX_CONSECUTIVE_ORDER_FAILURES:
+        log.warning(f"Circuit breaker: {cb_failures} consecutive order failures, "
                     f"trading paused | {title[:45]}")
         _log_skip(conn, pos, wallet_name, "circuit_breaker",
-                  f"consecutive_failures={_consecutive_order_failures}")
+                  f"consecutive_failures={cb_failures}")
         conn.commit()
         return False
 
@@ -926,6 +1082,15 @@ def copy_position(conn, pos: dict, wallet_name: str,
             conn.commit()
             return False
 
+    # ── Safety: global exposure cap (post-trade) ──
+    total_stake = _total_open_stake(conn)
+    if total_stake + our_stake > cfg.max_total_exposure:
+        log.info(f"Skip: global exposure cap ${total_stake:.2f}+${our_stake:.2f}>${cfg.max_total_exposure} | {title[:45]}")
+        _log_skip(conn, pos, wallet_name, "global_exposure_cap",
+                  f"current=${total_stake:.2f} proposed=${our_stake:.2f} cap=${cfg.max_total_exposure}")
+        conn.commit()
+        return False
+
     log.info(f"{'[DRY]' if dry_run else '[COPY]'} BUY ${our_stake:.2f} @ {buy_price:.4f} "
              f"({our_shares:.1f} shares) | {title[:45]} ({outcome}) [{wallet_name}]")
 
@@ -969,8 +1134,22 @@ def copy_position(conn, pos: dict, wallet_name: str,
 
     if result.get("ok"):
         order_id = result.get("order_id", "")
-        log.info(f"Copied: order={order_id[:20]}...")
-        _consecutive_order_failures = 0  # reset on success
+        order_status = result.get("status", "")
+
+        # ── Post-order verification: require non-empty order_id ──
+        if not order_id or order_id == "unknown":
+            log.warning(f"Order reported success but order_id is missing/unknown — treating as unverified")
+            _log_order_attempt(conn, trade_id, asset, slug, source_wallet, wallet_name,
+                               buy_price, our_stake, our_shares, "unverified",
+                               "order_id missing or unknown", order_id or "")
+        else:
+            log.info(f"Copied: order={order_id[:20]}... status={order_status}")
+            _log_order_attempt(conn, trade_id, asset, slug, source_wallet, wallet_name,
+                               buy_price, our_stake, our_shares, "success", "", order_id)
+
+        # Reset circuit breaker on success
+        _set_runtime_state(conn, "consecutive_order_failures", "0")
+
         # Promote reservation to 'open'
         conn.execute("""UPDATE copy_trades SET
             order_id=?, status='open' WHERE id=?""",
@@ -979,8 +1158,15 @@ def copy_position(conn, pos: dict, wallet_name: str,
         return True
     else:
         err = result.get("error", "unknown")
-        _consecutive_order_failures += 1
-        log.warning(f"Order failed ({_consecutive_order_failures}/{MAX_CONSECUTIVE_ORDER_FAILURES}): {err}")
+        # Increment circuit breaker (persisted)
+        cb_failures = int(_get_runtime_state(conn, "consecutive_order_failures", "0")) + 1
+        _set_runtime_state(conn, "consecutive_order_failures", str(cb_failures))
+        _set_runtime_state(conn, "last_failure_at", utc_now_str())
+        log.warning(f"Order failed ({cb_failures}/{MAX_CONSECUTIVE_ORDER_FAILURES}): {err}")
+
+        _log_order_attempt(conn, trade_id, asset, slug, source_wallet, wallet_name,
+                           buy_price, our_stake, our_shares, "failed", str(err), "")
+
         # Delete the reservation — order never went through
         conn.execute("DELETE FROM copy_trades WHERE id=?", (trade_id,))
         _log_skip(conn, pos, wallet_name, "order_failed", str(err))
@@ -1035,11 +1221,25 @@ def run_monitor(dry_run: bool = False):
             # Refresh wallet list each cycle (additions/removals take effect)
             wallets = _db_fetchall(conn, "SELECT * FROM copy_wallets WHERE enabled=1")
 
+            # Check pause state once per cycle
+            is_paused = _get_runtime_state(conn, "trading_paused", "0") == "1"
+            if is_paused:
+                log.info("Trading paused — syncing only, no new trades")
+
             for w in wallets:
                 positions = _fetch_positions(w["wallet"])
+
+                if is_paused:
+                    # Still sync positions even when paused
+                    sync_wallet(conn, w["id"], w["wallet"], positions=positions)
+                    continue
+
                 for p in positions:
                     asset = p.get("asset", "")
-                    size = float(p.get("size", 0))
+                    try:
+                        size = float(p.get("size", 0))
+                    except (ValueError, TypeError):
+                        continue
                     if not asset or size <= 0:
                         continue
 
@@ -1051,7 +1251,10 @@ def run_monitor(dry_run: bool = False):
                         continue
 
                     # Quick pre-filter before heavier checks
-                    cur_price = float(p.get("curPrice", 0))
+                    try:
+                        cur_price = float(p.get("curPrice", 0))
+                    except (ValueError, TypeError):
+                        continue
                     if cur_price <= 0.005 or cur_price >= 0.995:
                         continue
 
@@ -1086,6 +1289,12 @@ def run_monitor(dry_run: bool = False):
             # Update P&L on our open trades
             _update_trade_pnl(conn)
 
+            # Log unrealised P&L warning if materially negative
+            unrealised = _unrealised_pnl(conn)
+            if unrealised < -cfg.max_daily_loss:
+                log.warning(f"Unrealised P&L ${unrealised:+.2f} exceeds daily loss cap "
+                            f"(${cfg.max_daily_loss}) — informational only, not blocking")
+
             # Check for resolved trades (confirmed via Gamma, not midpoint)
             _check_resolved_trades(conn)
 
@@ -1101,7 +1310,8 @@ def run_monitor(dry_run: bool = False):
             open_trades = _db_fetchone(conn,
                 "SELECT COUNT(*) as c FROM copy_trades WHERE status='open'")
             trade_count = open_trades["c"] if open_trades else 0
-            log.debug(f"Cycle complete | {trade_count} open trades")
+            total_exp = _total_open_stake(conn)
+            log.debug(f"Cycle complete | {trade_count} open trades | exposure ${total_exp:.2f}")
             time.sleep(cfg.poll_interval)
     except KeyboardInterrupt:
         log.info("Stopped.")
@@ -1115,6 +1325,11 @@ def print_status():
     """Show wallet positions and our copy trades separately."""
     cfg = Config()
     conn = _get_db()
+
+    # Pause state
+    paused = _get_runtime_state(conn, "trading_paused", "0") == "1"
+    if paused:
+        print(f"\n  ** TRADING PAUSED **")
 
     # ── Section 1: Tracked wallet positions ──
     wallets = _db_fetchall(conn, "SELECT * FROM copy_wallets WHERE enabled=1")
@@ -1209,24 +1424,23 @@ def _check_settings_health():
 
 
 def _check_api_health():
-    """Validate Gamma API is reachable and returning sane data.
+    """Validate Gamma API is reachable and returning sane data (with retry).
     Returns (ok, detail_msg)."""
-    try:
+    def _do_check():
         r = requests.get(f"{POLY_GAMMA}/events", params={"slug": "test"}, timeout=10)
         if r.status_code >= 500:
             return False, f"server error ({r.status_code})"
         if r.status_code >= 400:
-            # 400 on a test slug is expected — API is reachable
             return True, f"reachable ({r.status_code})"
-        # Validate response shape
         data = r.json()
         if not isinstance(data, list):
             return False, f"unexpected response type: {type(data).__name__}"
         return True, f"healthy ({r.status_code}, {len(data)} events)"
-    except requests.RequestException as e:
-        return False, str(e)
-    except (ValueError, TypeError) as e:
-        return False, f"bad response body: {e}"
+
+    result = _retry_request(_do_check, max_retries=2, backoff=1.0, label="api_health")
+    if result is None:
+        return False, "all retries failed"
+    return result
 
 
 def _count_stale_pending(conn):
@@ -1272,6 +1486,15 @@ def print_health():
               f"wallet_cap=${cfg.max_stake_per_wallet}  slug_cap=${cfg.max_stake_per_slug}")
 
     if conn:
+        # Pause state
+        paused = _get_runtime_state(conn, "trading_paused", "0") == "1"
+        print(f"  Trading: {'PAUSED' if paused else 'active'}")
+
+        # Circuit breaker
+        cb_failures = int(_get_runtime_state(conn, "consecutive_order_failures", "0"))
+        cb_status = f"TRIPPED ({cb_failures}/{MAX_CONSECUTIVE_ORDER_FAILURES})" if cb_failures >= MAX_CONSECUTIVE_ORDER_FAILURES else f"ok ({cb_failures}/{MAX_CONSECUTIVE_ORDER_FAILURES})"
+        print(f"  Circuit breaker: {cb_status}")
+
         # Wallets
         wallets = _db_fetchall(conn, "SELECT * FROM copy_wallets WHERE enabled=1")
         disabled = _db_fetchone(conn,
@@ -1287,6 +1510,15 @@ def print_health():
             "SELECT COUNT(*) as c FROM copy_trades WHERE status='closed'")
         print(f"  Trades: {open_t['c']} open, {pending_t['c']} pending, {closed_t['c']} closed")
 
+        # Exposure
+        total_exposure = _total_open_stake(conn)
+        if cfg:
+            print(f"  Exposure: ${total_exposure:.2f} / ${cfg.max_total_exposure:.2f}")
+
+        # Unrealised P&L
+        unrealised = _unrealised_pnl(conn)
+        print(f"  Unrealised P&L: ${unrealised:+.2f}")
+
         # Stale pending
         stale_count = _count_stale_pending(conn)
         if stale_count:
@@ -1299,7 +1531,7 @@ def print_health():
             loss_hit, daily_pnl = _daily_loss_check(conn, cfg)
             today_count = _daily_trade_count(conn)
             status_str = "BLOCKED" if loss_hit else "ok"
-            print(f"  Today: {today_count} trades, P&L ${daily_pnl:+.2f} [{status_str}]")
+            print(f"  Today: {today_count} trades, realised P&L ${daily_pnl:+.2f} [{status_str}]")
 
         conn.close()
 
@@ -1315,6 +1547,109 @@ def print_health():
         print(f"\n  HEALTH: DEGRADED — issues with: {', '.join(errors)}")
     else:
         print(f"\n  HEALTH: OK")
+
+
+def print_trades():
+    """Show trade-focused view: open, pending, and recent closed."""
+    conn = _get_db()
+
+    open_trades = _db_fetchall(conn,
+        "SELECT * FROM copy_trades WHERE status='open' ORDER BY placed_at DESC")
+    pending_trades = _db_fetchall(conn,
+        "SELECT * FROM copy_trades WHERE status='pending' ORDER BY placed_at DESC")
+    closed_trades = _db_fetchall(conn,
+        "SELECT * FROM copy_trades WHERE status='closed' ORDER BY closed_at DESC LIMIT 20")
+
+    print(f"\n  === Open Trades ({len(open_trades)}) ===")
+    if open_trades:
+        total_stake = sum(t.get("our_stake", 0) or 0 for t in open_trades)
+        unrealised = sum(t.get("pnl_usd", 0) or 0 for t in open_trades)
+        print(f"  Total staked: ${total_stake:.2f} | Unrealised P&L: ${unrealised:+.2f}")
+        print(f"\n  {'Title':<40s} {'Out':<8s} {'Entry':>6s} {'Cur':>6s} {'P&L':>8s} {'Source':<15s}")
+        print(f"  {'-'*40} {'-'*8} {'-'*6} {'-'*6} {'-'*8} {'-'*15}")
+        for t in open_trades:
+            cur = t.get("cur_price") or 0
+            pnl = t.get("pnl_usd") or 0
+            src = (t.get("source_pseudonym") or "")[:15]
+            print(f"  {(t['title'] or '')[:40]:<40s} {(t['outcome'] or '')[:8]:<8s} "
+                  f"{t['our_entry_price']:>6.3f} {cur:>6.3f} "
+                  f"${pnl:>+6.2f} {src:<15s}")
+
+    if pending_trades:
+        print(f"\n  === Pending Trades ({len(pending_trades)}) ===")
+        for t in pending_trades:
+            print(f"  {(t['title'] or '')[:50]:<50s} placed={t.get('placed_at','')}")
+
+    if closed_trades:
+        total_closed_pnl = sum(t.get("pnl_usd", 0) or 0 for t in closed_trades)
+        print(f"\n  === Recent Closed ({len(closed_trades)}, P&L: ${total_closed_pnl:+.2f}) ===")
+        for t in closed_trades:
+            pnl = t.get("pnl_usd") or 0
+            print(f"  {(t['title'] or '')[:45]:<45s} ${pnl:>+6.2f}  {t.get('closed_at','')}")
+
+    conn.close()
+
+
+def run_cleanup():
+    """Clean stale pending trades and optionally reset circuit breaker."""
+    conn = _get_db()
+
+    cleaned = _cleanup_stale_pending(conn)
+    if cleaned:
+        print(f"  Cleaned {cleaned} stale pending trade(s)")
+    else:
+        print(f"  No stale pending trades")
+
+    cb_failures = int(_get_runtime_state(conn, "consecutive_order_failures", "0"))
+    if cb_failures > 0:
+        _set_runtime_state(conn, "consecutive_order_failures", "0")
+        print(f"  Reset circuit breaker (was at {cb_failures}/{MAX_CONSECUTIVE_ORDER_FAILURES})")
+    else:
+        print(f"  Circuit breaker: ok (0/{MAX_CONSECUTIVE_ORDER_FAILURES})")
+
+    conn.close()
+
+
+def print_config():
+    """Print current config and runtime state."""
+    cfg, cfg_err = _check_settings_health()
+    if cfg_err:
+        print(f"  Settings: FAILED — {cfg_err}")
+        return
+
+    print(f"\n  === Config (from settings.json) ===")
+    print(f"  max_shares:           {cfg.max_shares}")
+    print(f"  max_positions:        {cfg.max_positions}")
+    print(f"  tp_pct:               {cfg.tp_pct}")
+    print(f"  poll_interval:        {cfg.poll_interval}s")
+    print(f"  max_price_slip:       {cfg.max_price_slip}")
+    print(f"  max_daily_loss:       ${cfg.max_daily_loss}")
+    print(f"  max_trades_per_day:   {cfg.max_trades_per_day}")
+    print(f"  max_stake_per_wallet: ${cfg.max_stake_per_wallet}")
+    print(f"  max_stake_per_slug:   ${cfg.max_stake_per_slug}")
+    print(f"  max_total_exposure:   ${cfg.max_total_exposure}")
+
+    conn = _get_db()
+    print(f"\n  === Runtime State ===")
+    paused = _get_runtime_state(conn, "trading_paused", "0")
+    print(f"  trading_paused:       {'YES' if paused == '1' else 'no'}")
+    cb = _get_runtime_state(conn, "consecutive_order_failures", "0")
+    print(f"  circuit_breaker:      {cb}/{MAX_CONSECUTIVE_ORDER_FAILURES}")
+    last_fail = _get_runtime_state(conn, "last_failure_at", "never")
+    print(f"  last_failure_at:      {last_fail}")
+
+    print(f"\n  === Daily Stats ===")
+    loss_hit, daily_pnl = _daily_loss_check(conn, cfg)
+    today_count = _daily_trade_count(conn)
+    total_exp = _total_open_stake(conn)
+    unrealised = _unrealised_pnl(conn)
+    print(f"  trades_today:         {today_count}/{cfg.max_trades_per_day}")
+    print(f"  realised_pnl_today:   ${daily_pnl:+.2f} (limit: -${cfg.max_daily_loss})")
+    print(f"  unrealised_pnl:       ${unrealised:+.2f}")
+    print(f"  total_exposure:       ${total_exp:.2f} / ${cfg.max_total_exposure}")
+    print(f"  daily_loss_block:     {'YES' if loss_hit else 'no'}")
+
+    conn.close()
 
 
 def startup_checks():
@@ -1345,7 +1680,9 @@ def startup_checks():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Copy Scanner — entry-copy wallet positions")
     parser.add_argument("command", nargs="?", default="monitor",
-                        choices=["monitor", "add", "remove", "wallets", "sync", "status", "health"],
+                        choices=["monitor", "add", "remove", "wallets", "sync",
+                                 "status", "health", "pause", "resume",
+                                 "trades", "cleanup", "config"],
                         help="Command to run")
     parser.add_argument("wallet", nargs="?", default="",
                         help="Wallet address (for add/remove/sync)")
@@ -1367,6 +1704,24 @@ if __name__ == "__main__":
         list_wallets(conn)
     elif args.command == "sync":
         sync_all(conn, wallet_filter=args.wallet or None)
+    elif args.command == "pause":
+        _set_runtime_state(conn, "trading_paused", "1")
+        print("  Trading PAUSED. Monitor will continue syncing but not place trades.")
+        print("  Use 'resume' to re-enable trading.")
+    elif args.command == "resume":
+        _set_runtime_state(conn, "trading_paused", "0")
+        _set_runtime_state(conn, "consecutive_order_failures", "0")
+        print("  Trading RESUMED. Circuit breaker reset.")
+    elif args.command == "trades":
+        conn.close()
+        print_trades()
+        sys.exit(0)
+    elif args.command == "cleanup":
+        run_cleanup()
+    elif args.command == "config":
+        conn.close()
+        print_config()
+        sys.exit(0)
     elif args.command == "status":
         conn.close()
         print_status()

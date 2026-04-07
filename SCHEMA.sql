@@ -1,5 +1,5 @@
 -- =============================================================
--- copy_scanner.db — full schema
+-- copy_scanner.db — full schema (v3)
 -- =============================================================
 
 CREATE TABLE copy_wallets (
@@ -75,6 +75,31 @@ CREATE TABLE copy_skips (
     details TEXT
 );
 
+-- Runtime state: circuit breaker, pause flag, etc. Persists across restarts.
+CREATE TABLE copy_runtime_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TEXT
+);
+
+-- Order audit: every buy attempt recorded for debugging & post-mortems.
+CREATE TABLE copy_order_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER,
+    asset TEXT,
+    slug TEXT,
+    source_wallet TEXT,
+    source_pseudonym TEXT,
+    attempt_time TEXT,
+    requested_price REAL,
+    requested_stake REAL,
+    requested_size REAL,
+    result_status TEXT,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    order_id TEXT
+);
+
 CREATE TABLE copy_schema_version (
     version INTEGER NOT NULL
 );
@@ -87,5 +112,5 @@ CREATE INDEX idx_ct_asset_status ON copy_trades(asset, status);
 CREATE INDEX idx_ct_slug_status ON copy_trades(slug, status);
 CREATE INDEX idx_cs_reason ON copy_skips(reason);
 CREATE UNIQUE INDEX idx_ct_unique_open_asset ON copy_trades(asset) WHERE status IN ('pending', 'open');
-
-
+CREATE INDEX idx_coa_asset ON copy_order_attempts(asset);
+CREATE INDEX idx_coa_attempt_time ON copy_order_attempts(attempt_time);

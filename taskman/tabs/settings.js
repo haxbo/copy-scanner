@@ -4,7 +4,8 @@ const SETTINGS_GROUPS = {
     'Copy Trading': ['copy_enabled', 'copy_max_shares', 'copy_max_positions', 'copy_tp_pct',
                       'copy_poll_interval', 'copy_max_price_slip',
                       'copy_max_daily_loss', 'copy_max_trades_per_day',
-                      'copy_max_stake_per_wallet', 'copy_max_stake_per_slug'],
+                      'copy_max_stake_per_wallet', 'copy_max_stake_per_slug',
+                      'copy_max_total_exposure_usd'],
     'Cross Arb (Kalshi)': ['xarb_enabled', 'xarb_poll_interval', 'xarb_min_edge'],
     'Cross Arb (Betfair)': ['cross_arb_strict_enabled', 'cross_arb_strict_stake',
                              'cross_arb_loose_enabled', 'cross_arb_loose_stake',
@@ -35,6 +36,7 @@ const COPY_PRESETS = {
             copy_max_daily_loss: 20,
             copy_max_stake_per_wallet: 15,
             copy_max_stake_per_slug: 10,
+            copy_max_total_exposure_usd: 50,
         },
     },
     conservative: {
@@ -47,6 +49,7 @@ const COPY_PRESETS = {
             copy_max_daily_loss: 50,
             copy_max_stake_per_wallet: 30,
             copy_max_stake_per_slug: 15,
+            copy_max_total_exposure_usd: 100,
         },
     },
     aggressive: {
@@ -59,6 +62,7 @@ const COPY_PRESETS = {
             copy_max_daily_loss: 100,
             copy_max_stake_per_wallet: 50,
             copy_max_stake_per_slug: 25,
+            copy_max_total_exposure_usd: 250,
         },
     },
 };
@@ -74,6 +78,7 @@ const SETTING_DESCRIPTIONS = {
     copy_max_trades_per_day: 'Max new trades per UTC day',
     copy_max_stake_per_wallet: 'Max total open stake from any single source wallet (USD)',
     copy_max_stake_per_slug: 'Max total open stake on any single market/slug (USD)',
+    copy_max_total_exposure_usd: 'Global cap on total open stake across ALL trades (USD)',
 };
 
 let originalSettings = {};

@@ -165,7 +165,8 @@ def _save_settings(settings):
 ALLOWED_TABLES = {
     "copy_scanner": {
         "db": "copy_scanner.db",
-        "tables": ["copy_wallets", "copy_positions", "copy_trades", "copy_skips"],
+        "tables": ["copy_wallets", "copy_positions", "copy_trades", "copy_skips",
+                   "copy_order_attempts", "copy_runtime_state"],
     },
     "cross_platform_arb": {
         "db": "cross_platform_arb.db",
