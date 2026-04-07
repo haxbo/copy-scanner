@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HaxFish Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">&#x1F41F;</span>
+                <h1>HaxFish <span class="logo-accent">Dashboard</span></h1>
+            </div>
+        </div>
+        <div class="header-right">
+            <span class="sync-time" id="last-refresh">--</span>
+            <button class="btn btn-sm" onclick="refreshCurrentTab()">Refresh</button>
+        </div>
+    </div>
+
+    <nav class="tab-bar" id="tab-bar">
+        <button class="tab active" data-tab="tasks">Tasks</button>
+        <button class="tab" data-tab="copy_wallets">Wallets</button>
+        <button class="tab" data-tab="copy_positions">Positions</button>
+        <button class="tab" data-tab="copy_trades">Trades</button>
+        <button class="tab" data-tab="copy_skips">Skips</button>
+        <button class="tab" data-tab="xarb_scans">XArb Scans</button>
+        <button class="tab" data-tab="xarb_alerts">XArb Alerts</button>
+        <button class="tab" data-tab="settings">Settings</button>
+    </nav>
+
+    <div class="container">
+        <div id="content-area"></div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script src="app.js"></script>
+    <script src="tabs/tasks.js"></script>
+    <script src="tabs/data-table.js"></script>
+    <script src="tabs/settings.js"></script>
+</body>
+</html>
