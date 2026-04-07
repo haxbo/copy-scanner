@@ -584,6 +584,62 @@ TOGGLEABLE = {
 }
 
 
+def _add_wallet(wallet_address):
+    """Add a wallet to copy_wallets. Fetches pseudonym from Polymarket."""
+    wallet = wallet_address.lower().strip()
+    if not wallet or len(wallet) < 10:
+        return {"ok": False, "error": "Invalid wallet address"}
+
+    db_path = PROJECT_DIR / "copy_scanner.db"
+    try:
+        conn = sqlite3.connect(str(db_path))
+        existing = conn.execute(
+            "SELECT id, enabled FROM copy_wallets WHERE wallet=?", (wallet,)).fetchone()
+        if existing:
+            if not existing[1]:
+                conn.execute("UPDATE copy_wallets SET enabled=1 WHERE id=?", (existing[0],))
+                conn.commit()
+                conn.close()
+                return {"ok": True, "message": "Re-enabled existing wallet"}
+            conn.close()
+            return {"ok": False, "error": "Wallet already tracked"}
+
+        pseudonym = ""
+        try:
+            import requests
+            r = requests.get("https://data-api.polymarket.com/activity",
+                             params={"user": wallet, "limit": 1}, timeout=10)
+            if r.ok:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    pseudonym = data[0].get("pseudonym", "")
+        except Exception:
+            pass
+
+        conn.execute("INSERT INTO copy_wallets (wallet, pseudonym) VALUES (?, ?)",
+                     (wallet, pseudonym))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "message": f"Added {wallet[:10]}... ({pseudonym or 'unknown'})"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _delete_wallet(row_id):
+    """Delete a wallet from copy_wallets by id."""
+    db_path = PROJECT_DIR / "copy_scanner.db"
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute("DELETE FROM copy_wallets WHERE id=?", (row_id,))
+        conn.commit()
+        conn.close()
+        if cur.rowcount:
+            return {"ok": True}
+        return {"ok": False, "error": "Wallet not found"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _toggle_bool(db_name, table, row_id, column):
     """Toggle a boolean column on a whitelisted table."""
     key = (db_name, table)
@@ -674,6 +730,20 @@ class TaskHandler(SimpleHTTPRequestHandler):
                                                   int(parts[2]), parts[3]))
             else:
                 self._json_response({"ok": False, "error": "Bad toggle path"})
+        elif path == "/api/wallet/add":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                self._json_response(_add_wallet(data.get("wallet", "")))
+            except json.JSONDecodeError:
+                self._json_response({"ok": False, "error": "Invalid JSON"})
+        elif path.startswith("/api/wallet/delete/"):
+            try:
+                row_id = int(path.split("/api/wallet/delete/")[1])
+                self._json_response(_delete_wallet(row_id))
+            except (ValueError, IndexError):
+                self._json_response({"ok": False, "error": "Invalid ID"})
         elif path == "/api/settings":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)

@@ -292,6 +292,43 @@ function renderSummaryTable(area, tab, cfg, state, data) {
 function renderFlatTable(area, tab, cfg, state, data) {
     area.innerHTML = '';
 
+    // Add wallet bar (only for wallets tab)
+    if (tab === 'copy_wallets') {
+        const addBar = document.createElement('div');
+        addBar.className = 'wallet-add-bar';
+        addBar.innerHTML = `
+            <input type="text" id="wallet-input" placeholder="0x... wallet address"
+                   class="wallet-input" spellcheck="false" autocomplete="off">
+            <button id="wallet-add-btn" class="btn btn-sm btn-primary">Add Wallet</button>
+        `;
+        area.appendChild(addBar);
+
+        const input = addBar.querySelector('#wallet-input');
+        const btn = addBar.querySelector('#wallet-add-btn');
+        const doAdd = async () => {
+            const wallet = input.value.trim();
+            if (!wallet) return;
+            btn.disabled = true;
+            btn.textContent = 'Adding...';
+            const res = await fetchJSON('/api/wallet/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ wallet }),
+            });
+            btn.disabled = false;
+            btn.textContent = 'Add Wallet';
+            if (res.ok) {
+                showToast(res.message || 'Wallet added');
+                input.value = '';
+                renderDataTab(area, tab);
+            } else {
+                showToast('Error: ' + (res.error || 'unknown'));
+            }
+        };
+        btn.onclick = doAdd;
+        input.onkeydown = (e) => { if (e.key === 'Enter') doAdd(); };
+    }
+
     renderFilterBar(area, tab, cfg, state, data);
 
     if (!data.rows.length) {
@@ -299,6 +336,7 @@ function renderFlatTable(area, tab, cfg, state, data) {
         return;
     }
 
+    const isWallets = tab === 'copy_wallets';
     const wrapper = document.createElement('div');
     wrapper.className = 'table-wrapper';
     const table = document.createElement('table');
@@ -327,6 +365,12 @@ function renderFlatTable(area, tab, cfg, state, data) {
         };
         headerRow.appendChild(th);
     }
+    if (isWallets) {
+        const th = document.createElement('th');
+        th.textContent = '';
+        th.style.width = '60px';
+        headerRow.appendChild(th);
+    }
     thead.appendChild(headerRow);
     table.appendChild(thead);
 
@@ -334,6 +378,7 @@ function renderFlatTable(area, tab, cfg, state, data) {
     const tbody = document.createElement('tbody');
     for (const row of data.rows) {
         const tr = document.createElement('tr');
+        const idIdx = data.columns.indexOf('id');
         for (let i = 0; i < data.columns.length; i++) {
             const td = document.createElement('td');
             const col = data.columns[i];
@@ -345,7 +390,6 @@ function renderFlatTable(area, tab, cfg, state, data) {
                 td.style.color = val ? 'var(--profit)' : 'var(--text-3)';
                 td.textContent = val ? 'Yes' : 'No';
                 td.style.cursor = 'pointer';
-                const idIdx = data.columns.indexOf('id');
                 if (idIdx >= 0) {
                     const rowId = row[idIdx];
                     td.onclick = async () => {
@@ -364,6 +408,28 @@ function renderFlatTable(area, tab, cfg, state, data) {
 
             tr.appendChild(td);
         }
+
+        // Delete button
+        if (isWallets && idIdx >= 0) {
+            const td = document.createElement('td');
+            const delBtn = document.createElement('button');
+            delBtn.className = 'btn btn-sm btn-danger';
+            delBtn.textContent = 'Delete';
+            const rowId = row[idIdx];
+            delBtn.onclick = async () => {
+                if (!confirm('Delete this wallet? Position history will be kept.')) return;
+                const res = await fetchJSON(`/api/wallet/delete/${rowId}`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('Wallet deleted');
+                    renderDataTab(area, tab);
+                } else {
+                    showToast('Error: ' + (res.error || 'unknown'));
+                }
+            };
+            td.appendChild(delBtn);
+            tr.appendChild(td);
+        }
+
         tbody.appendChild(tr);
     }
     table.appendChild(tbody);

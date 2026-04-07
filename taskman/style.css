@@ -195,6 +195,45 @@ body {
 }
 .btn-log:hover { background: rgba(59, 130, 246, 0.2); border-color: var(--primary); }
 
+.btn-primary {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.4);
+    color: var(--primary);
+}
+.btn-primary:hover { background: rgba(59, 130, 246, 0.25); border-color: var(--primary); }
+
+.btn-danger {
+    background: rgba(255, 59, 92, 0.1);
+    border-color: rgba(255, 59, 92, 0.25);
+    color: var(--loss);
+    font-size: 11px;
+    padding: 4px 10px;
+}
+.btn-danger:hover { background: rgba(255, 59, 92, 0.2); border-color: var(--loss); }
+
+/* --- Wallet Add Bar --- */
+.wallet-add-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+    align-items: center;
+}
+.wallet-input {
+    flex: 1;
+    padding: 8px 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-1);
+    font-family: var(--mono);
+    font-size: 13px;
+}
+.wallet-input:focus {
+    outline: none;
+    border-color: var(--border-glow);
+}
+.wallet-input::placeholder { color: var(--text-3); }
+
 /* --- Log Modal --- */
 .modal-overlay {
     display: none;
